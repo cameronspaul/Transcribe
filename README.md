@@ -111,20 +111,28 @@ This keeps the extracted WAV file alongside the video.
 
 ### Full Options
 
+To see all available configuration options:
+
 ```bash
 python transcribe.py --help
 ```
 
+### Short Segments & Timing
+
+To create short, snappy subtitles (e.g., for TikTok/Reels):
+
+```bash
+python transcribe.py video.mp4 --max-words 3
+```
+
+*Note: The script will prioritize splitting at sentence endings (`.`, `!`, `?`) even if the max words limit hasn't been reached.*
+
 ```
 usage: transcribe.py [-h] [-o OUTPUT] [--include-silence]
                      [--silence-threshold SILENCE_THRESHOLD]
-                     [--min-silence MIN_SILENCE] [--keep-audio]
+                     [--min-silence MIN_SILENCE] [--keep-audio] 
+                     [--chunk-duration CHUNK_DURATION] [--max-words MAX_WORDS]
                      video
-
-Transcribe video to SRT using NVIDIA Parakeet TDT 0.6B V3
-
-positional arguments:
-  video                 Path to the input video file
 
 optional arguments:
   -h, --help            show this help message and exit
@@ -134,6 +142,8 @@ optional arguments:
   --silence-threshold   Volume threshold (dB) for silence detection (default: -40)
   --min-silence         Minimum silence duration in seconds (default: 0.5)
   --keep-audio          Keep the extracted audio file
+  --max-words           Max words per segment (default: 5, use 0 for sentence-based)
+  --chunk-duration      Audio chunking for memory (default: 60s)
 ```
 
 ## 📁 Output Format
