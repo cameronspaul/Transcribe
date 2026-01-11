@@ -187,7 +187,7 @@ def load_asr_model():
     return asr_model
 
 
-def transcribe_audio_chunk(asr_model, audio_path: str, chunk_offset: float = 0.0) -> List[dict]:
+def transcribe_audio_chunk(asr_model, audio_path: str, chunk_offset: float = 0.0, max_words: int = 0) -> List[dict]:
     """
     Transcribe a single audio chunk using the ASR model with timestamps.
     
@@ -195,6 +195,7 @@ def transcribe_audio_chunk(asr_model, audio_path: str, chunk_offset: float = 0.0
         asr_model: Loaded ASR model
         audio_path: Path to the audio chunk file
         chunk_offset: Time offset to add to timestamps
+        max_words: Maximum words per segment (0 for default sentence-based)
     
     Returns:
         List of segment dictionaries with text and timestamps
@@ -213,58 +214,120 @@ def transcribe_audio_chunk(asr_model, audio_path: str, chunk_offset: float = 0.0
     if output and len(output) > 0:
         result = output[0]
         
-        # Get segment-level timestamps
-        if hasattr(result, 'timestamp') and result.timestamp:
-            segment_timestamps = result.timestamp.get('segment', [])
+        # Get timestamps if available
+        has_ts = hasattr(result, 'timestamp') and result.timestamp
+        word_timestamps = result.timestamp.get('word', []) if has_ts else []
+        segment_timestamps = result.timestamp.get('segment', []) if has_ts else []
+        
+        # Priority 1: Group by word count if requested and word timestamps are available
+        if max_words > 0 and word_timestamps:
+            current_words = []
+            segment_start = None
             
-            for stamp in segment_timestamps:
+            for word_info in word_timestamps:
+                word = word_info.get('word', word_info.get('char', '')).strip()
+                if not word:
+                    continue
+                
+                if segment_start is None:
+                    segment_start = word_info['start'] + chunk_offset
+                
+                current_words.append(word)
+                segment_end = word_info['end'] + chunk_offset
+                
+                # Check for break: max words OR sentence end punctuation
+                if len(current_words) >= max_words or word.endswith(('.', '!', '?', ':')):
+                    segments.append({
+                        'start': segment_start,
+                        'end': segment_end,
+                        'text': ' '.join(current_words)
+                    })
+                    current_words = []
+                    segment_start = None
+            
+            # Add remaining words
+            if current_words:
                 segments.append({
-                    'start': stamp['start'] + chunk_offset,
-                    'end': stamp['end'] + chunk_offset,
-                    'text': stamp['segment'].strip()
+                    'start': segment_start,
+                    'end': segment_end,
+                    'text': ' '.join(current_words)
                 })
-        else:
-            # Fallback: use word timestamps to create segments
-            word_timestamps = result.timestamp.get('word', []) if hasattr(result, 'timestamp') else []
+        
+        # Priority 2: Use native segments if max_words is 0 or word timestamps missing
+        elif segment_timestamps:
+            for stamp in segment_timestamps:
+                text = stamp['segment'].strip()
+                start = stamp['start'] + chunk_offset
+                end = stamp['end'] + chunk_offset
+                
+                # If segment is too long and max_words is set, split it (simple interpolation)
+                words = text.split()
+                if max_words > 0 and len(words) > max_words:
+                    duration = end - start
+                    for i in range(0, len(words), max_words):
+                        chunk = words[i:i + max_words]
+                        chunk_start = start + (i / len(words)) * duration
+                        chunk_end = start + (min(i + max_words, len(words)) / len(words)) * duration
+                        segments.append({
+                            'start': chunk_start,
+                            'end': chunk_end,
+                            'text': ' '.join(chunk)
+                        })
+                else:
+                    segments.append({
+                        'start': start,
+                        'end': end,
+                        'text': text
+                    })
+        
+        # Priority 3: Use word timestamps with sentence logic (fallback)
+        elif word_timestamps:
+            current_segment = {
+                'start': word_timestamps[0]['start'] + chunk_offset,
+                'text': '',
+                'words': []
+            }
             
-            if word_timestamps:
-                # Group words into segments (by sentence or punctuation)
-                current_segment = {
-                    'start': word_timestamps[0]['start'] + chunk_offset,
-                    'text': '',
-                    'words': []
-                }
+            for word_info in word_timestamps:
+                word = word_info.get('word', word_info.get('char', ''))
+                current_segment['words'].append(word)
+                current_segment['end'] = word_info['end'] + chunk_offset
                 
-                for word_info in word_timestamps:
-                    word = word_info.get('word', word_info.get('char', ''))
-                    current_segment['words'].append(word)
-                    current_segment['end'] = word_info['end'] + chunk_offset
-                    
-                    # Check for sentence ending punctuation
-                    if word.rstrip().endswith(('.', '!', '?', ':')):
-                        current_segment['text'] = ' '.join(current_segment['words']).strip()
-                        del current_segment['words']
-                        segments.append(current_segment)
-                        
-                        # Start new segment
-                        current_segment = {
-                            'start': word_info['end'] + chunk_offset,
-                            'text': '',
-                            'words': []
-                        }
-                
-                # Add remaining segment
-                if current_segment.get('words'):
+                # Check for sentence ending punctuation
+                if word.rstrip().endswith(('.', '!', '?', ':')):
                     current_segment['text'] = ' '.join(current_segment['words']).strip()
                     del current_segment['words']
-                    if current_segment['text']:
-                        segments.append(current_segment)
+                    segments.append(current_segment)
+                    
+                    # Start new segment
+                    current_segment = {
+                        'start': word_info['end'] + chunk_offset,
+                        'text': '',
+                        'words': []
+                    }
+            
+            # Add remaining segment
+            if current_segment.get('words'):
+                current_segment['text'] = ' '.join(current_segment['words']).strip()
+                del current_segment['words']
+                if current_segment['text']:
+                    segments.append(current_segment)
+        
+        # Priority 4: Last fallback: single segment with full text
+        else:
+            text = ""
+            if hasattr(result, 'text'):
+                text = result.text
+            elif isinstance(result, str):
+                text = result
             else:
-                # Last fallback: single segment with full text
+                text = str(result)
+                
+            if text:
                 segments.append({
                     'start': chunk_offset,
-                    'end': chunk_offset,  # Will be estimated
-                    'text': result.text if hasattr(result, 'text') else str(result)
+                    'end': chunk_offset,  # Error case, but keeps it running
+                    'text': text
                 })
     
     # Clear CUDA cache after transcription
@@ -274,7 +337,7 @@ def transcribe_audio_chunk(asr_model, audio_path: str, chunk_offset: float = 0.0
     return segments
 
 
-def transcribe_audio(asr_model, audio_path: str, chunk_duration: float = 60.0) -> List[dict]:
+def transcribe_audio(asr_model, audio_path: str, chunk_duration: float = 60.0, max_words: int = 0) -> List[dict]:
     """
     Transcribe audio file using the ASR model with timestamps.
     Processes audio in chunks to avoid CUDA out of memory errors.
@@ -283,6 +346,7 @@ def transcribe_audio(asr_model, audio_path: str, chunk_duration: float = 60.0) -
         asr_model: Loaded ASR model
         audio_path: Path to the audio file
         chunk_duration: Duration of each chunk in seconds (default: 60s)
+        max_words: Maximum words per segment (0 for default sentence-based)
     
     Returns:
         List of segment dictionaries with text and timestamps
@@ -298,7 +362,7 @@ def transcribe_audio(asr_model, audio_path: str, chunk_duration: float = 60.0) -
     # If audio is short enough, transcribe in one go
     if total_duration <= chunk_duration:
         console.print(f"[dim]Processing audio in single pass ({total_duration:.1f}s)[/dim]")
-        return transcribe_audio_chunk(asr_model, audio_path, 0.0)
+        return transcribe_audio_chunk(asr_model, audio_path, 0.0, max_words)
     
     # Process in chunks for longer audio
     console.print(f"[dim]Processing {total_duration:.1f}s audio in {chunk_duration:.0f}s chunks to save memory[/dim]")
@@ -323,7 +387,7 @@ def transcribe_audio(asr_model, audio_path: str, chunk_duration: float = 60.0) -
             sf.write(chunk_path, chunk_audio, sample_rate)
             
             # Transcribe chunk
-            chunk_segments = transcribe_audio_chunk(asr_model, chunk_path, chunk_offset)
+            chunk_segments = transcribe_audio_chunk(asr_model, chunk_path, chunk_offset, max_words)
             
             # For overlapping chunks, skip segments that were already captured
             if i > 0 and all_segments:
@@ -440,7 +504,8 @@ def transcribe_video(
     silence_threshold_db: float = -40.0,
     min_silence_duration: float = 0.5,
     keep_audio: bool = False,
-    chunk_duration: float = 60.0
+    chunk_duration: float = 60.0,
+    max_words: int = 0
 ) -> str:
     """
     Main function to transcribe a video file to SRT format.
@@ -453,6 +518,7 @@ def transcribe_video(
         min_silence_duration: Minimum duration to consider as silence
         keep_audio: Whether to keep the extracted audio file
         chunk_duration: Duration of each audio chunk for memory-efficient processing
+        max_words: Maximum words per segment (0 for default sentence-based)
     
     Returns:
         Path to the generated SRT file
@@ -507,7 +573,7 @@ def transcribe_video(
         
         # Step 3: Load model and transcribe
         asr_model = load_asr_model()
-        speech_segments = transcribe_audio(asr_model, str(audio_path), chunk_duration)
+        speech_segments = transcribe_audio(asr_model, str(audio_path), chunk_duration, max_words)
         
         # Step 4: Merge with silence markers
         all_segments = merge_with_silence(
@@ -586,6 +652,13 @@ Examples:
         help="Duration of each audio chunk in seconds for memory-efficient processing (default: 60). Lower values use less GPU memory but may affect accuracy at chunk boundaries."
     )
     
+    parser.add_argument(
+        "--max-words",
+        type=int,
+        default=5,
+        help="Maximum words per SRT segment (default: 5, use 0 for original sentence-based segments)"
+    )
+    
     args = parser.parse_args()
     
     try:
@@ -596,7 +669,8 @@ Examples:
             silence_threshold_db=args.silence_threshold,
             min_silence_duration=args.min_silence,
             keep_audio=args.keep_audio,
-            chunk_duration=args.chunk_duration
+            chunk_duration=args.chunk_duration,
+            max_words=args.max_words
         )
     except Exception as e:
         console.print(f"\n[bold red]Error:[/bold red] {e}")
