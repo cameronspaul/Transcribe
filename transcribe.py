@@ -187,23 +187,27 @@ def load_asr_model():
     return asr_model
 
 
-def transcribe_audio(asr_model, audio_path: str) -> List[dict]:
+def transcribe_audio_chunk(asr_model, audio_path: str, chunk_offset: float = 0.0) -> List[dict]:
     """
-    Transcribe audio file using the ASR model with timestamps.
+    Transcribe a single audio chunk using the ASR model with timestamps.
     
     Args:
         asr_model: Loaded ASR model
-        audio_path: Path to the audio file
+        audio_path: Path to the audio chunk file
+        chunk_offset: Time offset to add to timestamps
     
     Returns:
         List of segment dictionaries with text and timestamps
     """
-    console.print("[cyan]Transcribing audio...[/cyan]")
+    import torch
+    
+    # Clear CUDA cache before transcription
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     
     # Transcribe with timestamps enabled
     output = asr_model.transcribe([audio_path], timestamps=True)
     
-    # Extract segment timestamps
     segments = []
     
     if output and len(output) > 0:
@@ -215,8 +219,8 @@ def transcribe_audio(asr_model, audio_path: str) -> List[dict]:
             
             for stamp in segment_timestamps:
                 segments.append({
-                    'start': stamp['start'],
-                    'end': stamp['end'],
+                    'start': stamp['start'] + chunk_offset,
+                    'end': stamp['end'] + chunk_offset,
                     'text': stamp['segment'].strip()
                 })
         else:
@@ -226,7 +230,7 @@ def transcribe_audio(asr_model, audio_path: str) -> List[dict]:
             if word_timestamps:
                 # Group words into segments (by sentence or punctuation)
                 current_segment = {
-                    'start': word_timestamps[0]['start'],
+                    'start': word_timestamps[0]['start'] + chunk_offset,
                     'text': '',
                     'words': []
                 }
@@ -234,7 +238,7 @@ def transcribe_audio(asr_model, audio_path: str) -> List[dict]:
                 for word_info in word_timestamps:
                     word = word_info.get('word', word_info.get('char', ''))
                     current_segment['words'].append(word)
-                    current_segment['end'] = word_info['end']
+                    current_segment['end'] = word_info['end'] + chunk_offset
                     
                     # Check for sentence ending punctuation
                     if word.rstrip().endswith(('.', '!', '?', ':')):
@@ -244,7 +248,7 @@ def transcribe_audio(asr_model, audio_path: str) -> List[dict]:
                         
                         # Start new segment
                         current_segment = {
-                            'start': word_info['end'],
+                            'start': word_info['end'] + chunk_offset,
                             'text': '',
                             'words': []
                         }
@@ -258,13 +262,86 @@ def transcribe_audio(asr_model, audio_path: str) -> List[dict]:
             else:
                 # Last fallback: single segment with full text
                 segments.append({
-                    'start': 0.0,
-                    'end': 0.0,  # Will be estimated
+                    'start': chunk_offset,
+                    'end': chunk_offset,  # Will be estimated
                     'text': result.text if hasattr(result, 'text') else str(result)
                 })
     
-    console.print(f"[green]✓ Transcribed {len(segments)} segments[/green]")
+    # Clear CUDA cache after transcription
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
     return segments
+
+
+def transcribe_audio(asr_model, audio_path: str, chunk_duration: float = 60.0) -> List[dict]:
+    """
+    Transcribe audio file using the ASR model with timestamps.
+    Processes audio in chunks to avoid CUDA out of memory errors.
+    
+    Args:
+        asr_model: Loaded ASR model
+        audio_path: Path to the audio file
+        chunk_duration: Duration of each chunk in seconds (default: 60s)
+    
+    Returns:
+        List of segment dictionaries with text and timestamps
+    """
+    import torch
+    
+    console.print("[cyan]Transcribing audio...[/cyan]")
+    
+    # Get audio info
+    audio, sample_rate = sf.read(audio_path)
+    total_duration = len(audio) / sample_rate
+    
+    # If audio is short enough, transcribe in one go
+    if total_duration <= chunk_duration:
+        console.print(f"[dim]Processing audio in single pass ({total_duration:.1f}s)[/dim]")
+        return transcribe_audio_chunk(asr_model, audio_path, 0.0)
+    
+    # Process in chunks for longer audio
+    console.print(f"[dim]Processing {total_duration:.1f}s audio in {chunk_duration:.0f}s chunks to save memory[/dim]")
+    
+    all_segments = []
+    chunk_samples = int(chunk_duration * sample_rate)
+    overlap_samples = int(2.0 * sample_rate)  # 2 second overlap for smooth transitions
+    
+    num_chunks = int(np.ceil(len(audio) / (chunk_samples - overlap_samples)))
+    
+    with tempfile.TemporaryDirectory() as temp_dir:
+        for i in range(num_chunks):
+            start_sample = i * (chunk_samples - overlap_samples)
+            end_sample = min(start_sample + chunk_samples, len(audio))
+            chunk_offset = start_sample / sample_rate
+            
+            console.print(f"[dim]  Chunk {i+1}/{num_chunks}: {chunk_offset:.1f}s - {end_sample/sample_rate:.1f}s[/dim]")
+            
+            # Extract chunk
+            chunk_audio = audio[start_sample:end_sample]
+            chunk_path = os.path.join(temp_dir, f"chunk_{i}.wav")
+            sf.write(chunk_path, chunk_audio, sample_rate)
+            
+            # Transcribe chunk
+            chunk_segments = transcribe_audio_chunk(asr_model, chunk_path, chunk_offset)
+            
+            # For overlapping chunks, skip segments that were already captured
+            if i > 0 and all_segments:
+                last_end_time = all_segments[-1]['end']
+                chunk_segments = [s for s in chunk_segments if s['start'] >= last_end_time - 0.5]
+            
+            all_segments.extend(chunk_segments)
+            
+            # Clean up chunk file
+            os.remove(chunk_path)
+            
+            # Clear CUDA cache between chunks
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+    
+    console.print(f"[green]✓ Transcribed {len(all_segments)} segments[/green]")
+    return all_segments
+
 
 
 def merge_with_silence(
@@ -362,7 +439,8 @@ def transcribe_video(
     include_silence: bool = False,
     silence_threshold_db: float = -40.0,
     min_silence_duration: float = 0.5,
-    keep_audio: bool = False
+    keep_audio: bool = False,
+    chunk_duration: float = 60.0
 ) -> str:
     """
     Main function to transcribe a video file to SRT format.
@@ -374,6 +452,7 @@ def transcribe_video(
         silence_threshold_db: Volume threshold for silence detection
         min_silence_duration: Minimum duration to consider as silence
         keep_audio: Whether to keep the extracted audio file
+        chunk_duration: Duration of each audio chunk for memory-efficient processing
     
     Returns:
         Path to the generated SRT file
@@ -428,7 +507,7 @@ def transcribe_video(
         
         # Step 3: Load model and transcribe
         asr_model = load_asr_model()
-        speech_segments = transcribe_audio(asr_model, str(audio_path))
+        speech_segments = transcribe_audio(asr_model, str(audio_path), chunk_duration)
         
         # Step 4: Merge with silence markers
         all_segments = merge_with_silence(
@@ -500,6 +579,13 @@ Examples:
         help="Keep the extracted audio file"
     )
     
+    parser.add_argument(
+        "--chunk-duration",
+        type=float,
+        default=60.0,
+        help="Duration of each audio chunk in seconds for memory-efficient processing (default: 60). Lower values use less GPU memory but may affect accuracy at chunk boundaries."
+    )
+    
     args = parser.parse_args()
     
     try:
@@ -509,7 +595,8 @@ Examples:
             include_silence=args.include_silence,
             silence_threshold_db=args.silence_threshold,
             min_silence_duration=args.min_silence,
-            keep_audio=args.keep_audio
+            keep_audio=args.keep_audio,
+            chunk_duration=args.chunk_duration
         )
     except Exception as e:
         console.print(f"\n[bold red]Error:[/bold red] {e}")
