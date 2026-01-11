@@ -1,0 +1,14 @@
+# NVIDIA NeMo for Parakeet ASR model
+nemo_toolkit[asr]
+
+# Audio/Video processing
+ffmpeg-python
+pydub
+
+# Progress indicators
+tqdm
+rich
+
+# Audio processing utilities
+soundfile
+librosa
