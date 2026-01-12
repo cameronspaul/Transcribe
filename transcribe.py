@@ -187,7 +187,7 @@ def load_asr_model():
     return asr_model
 
 
-def transcribe_audio_chunk(asr_model, audio_path: str, chunk_offset: float = 0.0, max_words: int = 0) -> List[dict]:
+def transcribe_audio_chunk(asr_model, audio_path: str, chunk_offset: float = 0.0, max_words: int = 0, word_gap: float = 0.5, time_offset: float = 0.0) -> List[dict]:
     """
     Transcribe a single audio chunk using the ASR model with timestamps.
     
@@ -196,6 +196,8 @@ def transcribe_audio_chunk(asr_model, audio_path: str, chunk_offset: float = 0.0
         audio_path: Path to the audio chunk file
         chunk_offset: Time offset to add to timestamps
         max_words: Maximum words per segment (0 for default sentence-based)
+        word_gap: Maximum silence (seconds) between words in a segment
+        time_offset: Global time offset to apply to all timestamps
     
     Returns:
         List of segment dictionaries with text and timestamps
@@ -219,116 +221,140 @@ def transcribe_audio_chunk(asr_model, audio_path: str, chunk_offset: float = 0.0
         word_timestamps = result.timestamp.get('word', []) if has_ts else []
         segment_timestamps = result.timestamp.get('segment', []) if has_ts else []
         
-        # Priority 1: Group by word count if requested and word timestamps are available
-        if max_words > 0 and word_timestamps:
-            current_words = []
-            segment_start = None
+    # Priority 1: Group by word count if requested and word timestamps are available
+    if max_words > 0 and word_timestamps:
+        current_words = []
+        segment_start = None
+        prev_word_end = None
+        
+        for word_info in word_timestamps:
+            word = word_info.get('word', word_info.get('char', '')).strip()
+            if not word:
+                continue
             
-            for word_info in word_timestamps:
-                word = word_info.get('word', word_info.get('char', '')).strip()
-                if not word:
-                    continue
-                
-                if segment_start is None:
-                    segment_start = word_info['start'] + chunk_offset
-                
-                current_words.append(word)
-                segment_end = word_info['end'] + chunk_offset
-                
-                # Check for break: max words OR sentence end punctuation
-                if len(current_words) >= max_words or word.endswith(('.', '!', '?', ':')):
-                    segments.append({
-                        'start': segment_start,
-                        'end': segment_end,
-                        'text': ' '.join(current_words)
-                    })
-                    current_words = []
-                    segment_start = None
+            w_start = word_info['start'] + chunk_offset + time_offset
+            w_end = word_info['end'] + chunk_offset + time_offset
             
-            # Add remaining words
-            if current_words:
+            # Check if we should start a new segment due to a large gap
+            should_break_gap = prev_word_end is not None and (w_start - prev_word_end) > word_gap
+            
+            if segment_start is None:
+                segment_start = w_start
+            
+            # If we should break, and we have words, emit current segment
+            # Breaks on: large gap, max words reached, or previous word had punctuation
+            if (should_break_gap or len(current_words) >= max_words or (current_words and current_words[-1].endswith(('.', '!', '?', ':', ',')))) and current_words:
                 segments.append({
                     'start': segment_start,
-                    'end': segment_end,
+                    'end': prev_word_end,
                     'text': ' '.join(current_words)
                 })
+                current_words = []
+                segment_start = w_start
+            
+            current_words.append(word)
+            prev_word_end = w_end
         
-        # Priority 2: Use native segments if max_words is 0 or word timestamps missing
-        elif segment_timestamps:
-            for stamp in segment_timestamps:
-                text = stamp['segment'].strip()
-                start = stamp['start'] + chunk_offset
-                end = stamp['end'] + chunk_offset
+        # Add remaining words
+        if current_words:
+            segments.append({
+                'start': segment_start,
+                'end': prev_word_end,
+                'text': ' '.join(current_words)
+            })
+        
+    # Priority 2: Use native segments if max_words is 0 or word timestamps missing
+    elif segment_timestamps:
+        for stamp in segment_timestamps:
+            text = stamp['segment'].strip()
+            start = stamp['start'] + chunk_offset + time_offset
+            end = stamp['end'] + chunk_offset + time_offset
+            
+            words = text.split()
+            if not words:
+                continue
+
+            # Split segment if it has punctuation or exceeds max_words
+            duration = end - start
+            current_chunk = []
+            chunk_start_idx = 0
+            
+            for i, word in enumerate(words):
+                # Check if we should break BEFORE adding the word
+                should_break_punct = current_chunk and current_chunk[-1].endswith(('.', '!', '?', ':', ','))
+                should_break_count = max_words > 0 and len(current_chunk) >= max_words
                 
-                # If segment is too long and max_words is set, split it (simple interpolation)
-                words = text.split()
-                if max_words > 0 and len(words) > max_words:
-                    duration = end - start
-                    for i in range(0, len(words), max_words):
-                        chunk = words[i:i + max_words]
-                        chunk_start = start + (i / len(words)) * duration
-                        chunk_end = start + (min(i + max_words, len(words)) / len(words)) * duration
-                        segments.append({
-                            'start': chunk_start,
-                            'end': chunk_end,
-                            'text': ' '.join(chunk)
-                        })
-                else:
+                if (should_break_punct or should_break_count) and current_chunk:
+                    chunk_start = start + (chunk_start_idx / len(words)) * duration
+                    chunk_end = start + (i / len(words)) * duration
                     segments.append({
-                        'start': start,
-                        'end': end,
-                        'text': text
+                        'start': chunk_start,
+                        'end': chunk_end,
+                        'text': ' '.join(current_chunk)
                     })
-        
-        # Priority 3: Use word timestamps with sentence logic (fallback)
-        elif word_timestamps:
-            current_segment = {
-                'start': word_timestamps[0]['start'] + chunk_offset,
-                'text': '',
-                'words': []
-            }
-            
-            for word_info in word_timestamps:
-                word = word_info.get('word', word_info.get('char', ''))
-                current_segment['words'].append(word)
-                current_segment['end'] = word_info['end'] + chunk_offset
+                    current_chunk = []
+                    chunk_start_idx = i
                 
-                # Check for sentence ending punctuation
-                if word.rstrip().endswith(('.', '!', '?', ':')):
-                    current_segment['text'] = ' '.join(current_segment['words']).strip()
-                    del current_segment['words']
-                    segments.append(current_segment)
-                    
-                    # Start new segment
-                    current_segment = {
-                        'start': word_info['end'] + chunk_offset,
-                        'text': '',
-                        'words': []
-                    }
+                current_chunk.append(word)
             
-            # Add remaining segment
-            if current_segment.get('words'):
+            # Add remaining words for this segment
+            if current_chunk:
+                chunk_start = start + (chunk_start_idx / len(words)) * duration
+                segments.append({
+                    'start': chunk_start,
+                    'end': end,
+                    'text': ' '.join(current_chunk)
+                })
+        
+    # Priority 3: Use word timestamps with sentence logic (fallback)
+    elif word_timestamps:
+        current_segment = {
+            'start': word_timestamps[0]['start'] + chunk_offset + time_offset,
+            'text': '',
+            'words': []
+        }
+        
+        for word_info in word_timestamps:
+            word = word_info.get('word', word_info.get('char', ''))
+            current_segment['words'].append(word)
+            current_segment['end'] = word_info['end'] + chunk_offset + time_offset
+            
+            # Check for punctuation (including commas)
+            if word.rstrip().endswith(('.', '!', '?', ':', ',')):
                 current_segment['text'] = ' '.join(current_segment['words']).strip()
                 del current_segment['words']
-                if current_segment['text']:
-                    segments.append(current_segment)
-        
-        # Priority 4: Last fallback: single segment with full text
-        else:
-            text = ""
-            if hasattr(result, 'text'):
-                text = result.text
-            elif isinstance(result, str):
-                text = result
-            else:
-                text = str(result)
+                segments.append(current_segment)
                 
-            if text:
-                segments.append({
-                    'start': chunk_offset,
-                    'end': chunk_offset,  # Error case, but keeps it running
-                    'text': text
-                })
+                # Start new segment
+                current_segment = {
+                    'start': word_info['end'] + chunk_offset + time_offset,
+                    'text': '',
+                    'words': []
+                }
+        
+        # Add remaining segment
+        if current_segment.get('words'):
+            current_segment['text'] = ' '.join(current_segment['words']).strip()
+            del current_segment['words']
+            if current_segment['text']:
+                segments.append(current_segment)
+    
+    # Priority 4: Last fallback: single segment with full text
+    else:
+        text = ""
+        if hasattr(result, 'text'):
+            text = result.text
+        elif isinstance(result, str):
+            text = result
+        else:
+            text = str(result)
+            
+        if text:
+            segments.append({
+                'start': chunk_offset + time_offset,
+                'end': chunk_offset + time_offset,  # Error case, but keeps it running
+                'text': text
+            })
     
     # Clear CUDA cache after transcription
     if torch.cuda.is_available():
@@ -337,7 +363,7 @@ def transcribe_audio_chunk(asr_model, audio_path: str, chunk_offset: float = 0.0
     return segments
 
 
-def transcribe_audio(asr_model, audio_path: str, chunk_duration: float = 60.0, max_words: int = 0) -> List[dict]:
+def transcribe_audio(asr_model, audio_path: str, chunk_duration: float = 60.0, max_words: int = 0, word_gap: float = 0.5, offset: float = 0.0) -> List[dict]:
     """
     Transcribe audio file using the ASR model with timestamps.
     Processes audio in chunks to avoid CUDA out of memory errors.
@@ -347,6 +373,8 @@ def transcribe_audio(asr_model, audio_path: str, chunk_duration: float = 60.0, m
         audio_path: Path to the audio file
         chunk_duration: Duration of each chunk in seconds (default: 60s)
         max_words: Maximum words per segment (0 for default sentence-based)
+        word_gap: Maximum silence (seconds) between words in a segment
+        offset: Global time offset to apply to all timestamps
     
     Returns:
         List of segment dictionaries with text and timestamps
@@ -362,7 +390,7 @@ def transcribe_audio(asr_model, audio_path: str, chunk_duration: float = 60.0, m
     # If audio is short enough, transcribe in one go
     if total_duration <= chunk_duration:
         console.print(f"[dim]Processing audio in single pass ({total_duration:.1f}s)[/dim]")
-        return transcribe_audio_chunk(asr_model, audio_path, 0.0, max_words)
+        return transcribe_audio_chunk(asr_model, audio_path, 0.0, max_words=max_words, word_gap=word_gap, time_offset=offset)
     
     # Process in chunks for longer audio
     console.print(f"[dim]Processing {total_duration:.1f}s audio in {chunk_duration:.0f}s chunks to save memory[/dim]")
@@ -387,12 +415,24 @@ def transcribe_audio(asr_model, audio_path: str, chunk_duration: float = 60.0, m
             sf.write(chunk_path, chunk_audio, sample_rate)
             
             # Transcribe chunk
-            chunk_segments = transcribe_audio_chunk(asr_model, chunk_path, chunk_offset, max_words)
+            chunk_segments = transcribe_audio_chunk(
+                asr_model, chunk_path, chunk_offset, 
+                max_words=max_words, word_gap=word_gap, time_offset=offset
+            )
             
-            # For overlapping chunks, skip segments that were already captured
+            # For overlapping chunks, merge carefully to avoid duplicates
             if i > 0 and all_segments:
+                # The overlap region starts at chunk_offset
+                # The previous chunk already covered up to this point (and slightly beyond)
+                # To avoid duplicates, we only take segments from the new chunk that start
+                # after the midpoint of the overlap or after the last segment ends.
                 last_end_time = all_segments[-1]['end']
-                chunk_segments = [s for s in chunk_segments if s['start'] >= last_end_time - 0.5]
+                # Midpoint of overlap is chunk_offset + overlap_duration/2
+                overlap_midpoint = chunk_offset + (overlap_samples / sample_rate) / 2
+                
+                # Filter segments that were likely already covered by the previous chunk
+                # We use the midpoint of the overlap as a cleaner cut-off than a fixed 0.5s
+                chunk_segments = [s for s in chunk_segments if s['start'] >= max(last_end_time, overlap_midpoint)]
             
             all_segments.extend(chunk_segments)
             
@@ -505,7 +545,9 @@ def transcribe_video(
     min_silence_duration: float = 0.5,
     keep_audio: bool = False,
     chunk_duration: float = 60.0,
-    max_words: int = 0
+    max_words: int = 0,
+    word_gap: float = 0.5,
+    offset: float = 0.0
 ) -> str:
     """
     Main function to transcribe a video file to SRT format.
@@ -519,6 +561,8 @@ def transcribe_video(
         keep_audio: Whether to keep the extracted audio file
         chunk_duration: Duration of each audio chunk for memory-efficient processing
         max_words: Maximum words per segment (0 for default sentence-based)
+        word_gap: Maximum silence (seconds) between words in a segment
+        offset: Global time offset to apply to all timestamps
     
     Returns:
         Path to the generated SRT file
@@ -573,7 +617,13 @@ def transcribe_video(
         
         # Step 3: Load model and transcribe
         asr_model = load_asr_model()
-        speech_segments = transcribe_audio(asr_model, str(audio_path), chunk_duration, max_words)
+        speech_segments = transcribe_audio(
+            asr_model, str(audio_path), 
+            chunk_duration=chunk_duration, 
+            max_words=max_words,
+            word_gap=word_gap,
+            offset=offset
+        )
         
         # Step 4: Merge with silence markers
         all_segments = merge_with_silence(
@@ -659,6 +709,20 @@ Examples:
         help="Maximum words per SRT segment (default: 5, use 0 for original sentence-based segments)"
     )
     
+    parser.add_argument(
+        "--word-gap",
+        type=float,
+        default=0.5,
+        help="Maximum silence in seconds between words before starting a new segment (default: 0.5)"
+    )
+    
+    parser.add_argument(
+        "--offset",
+        type=float,
+        default=0.0,
+        help="Global time offset in seconds to apply to all captions (e.g., -0.2 to advance captions by 200ms)"
+    )
+    
     args = parser.parse_args()
     
     try:
@@ -670,7 +734,9 @@ Examples:
             min_silence_duration=args.min_silence,
             keep_audio=args.keep_audio,
             chunk_duration=args.chunk_duration,
-            max_words=args.max_words
+            max_words=args.max_words,
+            word_gap=args.word_gap,
+            offset=args.offset
         )
     except Exception as e:
         console.print(f"\n[bold red]Error:[/bold red] {e}")

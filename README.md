@@ -109,29 +109,29 @@ python transcribe.py video.mp4 --keep-audio
 
 This keeps the extracted WAV file alongside the video.
 
-### Full Options
+### Improving Timing Accuracy
 
-To see all available configuration options:
-
-```bash
-python transcribe.py --help
-```
-
-### Short Segments & Timing
-
-To create short, snappy subtitles (e.g., for TikTok/Reels):
+If captions feel slightly off-sync or stay on screen during silences:
 
 ```bash
-python transcribe.py video.mp4 --max-words 3
+# Advance captions by 200ms (makes them appear earlier)
+python transcribe.py video.mp4 --offset -0.2
+
+# Break captions faster on pauses (0.3s instead of 0.5s)
+python transcribe.py video.mp4 --word-gap 0.3
 ```
 
-*Note: The script will prioritize splitting at sentence endings (`.`, `!`, `?`) even if the max words limit hasn't been reached.*
+- `--word-gap`: Maximum silence in seconds between words before starting a new segment (default: 0.5).
+- `--offset`: Global time offset in seconds to apply to all captions (e.g., -0.2 to advance, 0.2 to delay).
+
+### Full Help
 
 ```
 usage: transcribe.py [-h] [-o OUTPUT] [--include-silence]
                      [--silence-threshold SILENCE_THRESHOLD]
                      [--min-silence MIN_SILENCE] [--keep-audio] 
                      [--chunk-duration CHUNK_DURATION] [--max-words MAX_WORDS]
+                     [--word-gap WORD_GAP] [--offset OFFSET]
                      video
 
 optional arguments:
@@ -139,10 +139,12 @@ optional arguments:
   -o OUTPUT, --output OUTPUT
                         Path for the output SRT file
   --include-silence     Include [SILENCE] markers in the SRT output
-  --silence-threshold   Volume threshold (dB) for silence detection (default: -40)
-  --min-silence         Minimum silence duration in seconds (default: 0.5)
+  --silence-threshold   Volume threshold (dB) for silence detection
+  --min-silence         Minimum silence duration in seconds
   --keep-audio          Keep the extracted audio file
-  --max-words           Max words per segment (default: 5, use 0 for sentence-based)
+  --max-words           Max words per segment (default: 5)
+  --word-gap            Max silence between words (default: 0.5s)
+  --offset              Global time offset in seconds (default: 0.0)
   --chunk-duration      Audio chunking for memory (default: 60s)
 ```
 
