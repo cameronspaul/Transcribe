@@ -488,7 +488,8 @@ def write_srt(
     segments: List[dict],
     output_path: str,
     include_silence_markers: bool = False,
-    remove_punctuation: bool = False
+    remove_punctuation: bool = False,
+    uppercase: bool = False
 ) -> str:
     """
     Write segments to SRT file format.
@@ -497,8 +498,8 @@ def write_srt(
         segments: List of segment dictionaries
         output_path: Path for the output SRT file
         include_silence_markers: Whether to include [SILENCE] markers
-    
-    Returns:
+        remove_punctuation: Whether to remove common punctuation marks
+        uppercase: Whether to convert text to UPPERCASE
         Path to the written SRT file
     """
     console.print(f"[cyan]Writing SRT file...[/cyan]")
@@ -520,7 +521,12 @@ def write_srt(
             text = segment['text'].strip()
             
             if remove_punctuation:
-                text = text.replace(',', '').replace('.', '')
+                import re
+                # Remove common punctuation: . , ! ? : ;
+                text = re.sub(r'[,.!?:;]', '', text)
+            
+            if uppercase:
+                text = text.upper()
             
             f.write(f"{subtitle_index}\n")
             f.write(f"{start_time} --> {end_time}\n")
@@ -552,7 +558,8 @@ def transcribe_video(
     max_words: int = 0,
     word_gap: float = 0.5,
     offset: float = 0.0,
-    remove_punctuation: bool = False
+    remove_punctuation: bool = False,
+    uppercase: bool = False
 ) -> str:
     """
     Main function to transcribe a video file to SRT format.
@@ -569,6 +576,7 @@ def transcribe_video(
         word_gap: Maximum silence (seconds) between words in a segment
         offset: Global time offset to apply to all timestamps
         remove_punctuation: Whether to remove commas and full stops
+        uppercase: Whether to convert text to UPPERCASE
     
     Returns:
         Path to the generated SRT file
@@ -644,7 +652,8 @@ def transcribe_video(
             all_segments,
             str(output_path),
             include_silence_markers=include_silence,
-            remove_punctuation=remove_punctuation
+            remove_punctuation=remove_punctuation,
+            uppercase=uppercase
         )
     
     console.print(f"\n[bold green]✓ Transcription complete![/bold green]\n")
@@ -736,6 +745,12 @@ Examples:
         help="Remove commas and full stops from the SRT output"
     )
     
+    parser.add_argument(
+        "--uppercase",
+        action="store_true",
+        help="Convert all text to UPPERCASE"
+    )
+    
     args = parser.parse_args()
     
     try:
@@ -750,7 +765,8 @@ Examples:
             max_words=args.max_words,
             word_gap=args.word_gap,
             offset=args.offset,
-            remove_punctuation=args.remove_punctuation
+            remove_punctuation=args.remove_punctuation,
+            uppercase=args.uppercase
         )
     except Exception as e:
         console.print(f"\n[bold red]Error:[/bold red] {e}")
