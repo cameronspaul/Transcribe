@@ -487,7 +487,8 @@ def merge_with_silence(
 def write_srt(
     segments: List[dict],
     output_path: str,
-    include_silence_markers: bool = False
+    include_silence_markers: bool = False,
+    remove_punctuation: bool = False
 ) -> str:
     """
     Write segments to SRT file format.
@@ -518,6 +519,9 @@ def write_srt(
             end_time = format_timestamp(segment['end'])
             text = segment['text'].strip()
             
+            if remove_punctuation:
+                text = text.replace(',', '').replace('.', '')
+            
             f.write(f"{subtitle_index}\n")
             f.write(f"{start_time} --> {end_time}\n")
             f.write(f"{text}\n")
@@ -547,7 +551,8 @@ def transcribe_video(
     chunk_duration: float = 60.0,
     max_words: int = 0,
     word_gap: float = 0.5,
-    offset: float = 0.0
+    offset: float = 0.0,
+    remove_punctuation: bool = False
 ) -> str:
     """
     Main function to transcribe a video file to SRT format.
@@ -563,6 +568,7 @@ def transcribe_video(
         max_words: Maximum words per segment (0 for default sentence-based)
         word_gap: Maximum silence (seconds) between words in a segment
         offset: Global time offset to apply to all timestamps
+        remove_punctuation: Whether to remove commas and full stops
     
     Returns:
         Path to the generated SRT file
@@ -637,7 +643,8 @@ def transcribe_video(
         write_srt(
             all_segments,
             str(output_path),
-            include_silence_markers=include_silence
+            include_silence_markers=include_silence,
+            remove_punctuation=remove_punctuation
         )
     
     console.print(f"\n[bold green]✓ Transcription complete![/bold green]\n")
@@ -723,6 +730,12 @@ Examples:
         help="Global time offset in seconds to apply to all captions (e.g., -0.2 to advance captions by 200ms)"
     )
     
+    parser.add_argument(
+        "--remove-punctuation",
+        action="store_true",
+        help="Remove commas and full stops from the SRT output"
+    )
+    
     args = parser.parse_args()
     
     try:
@@ -736,7 +749,8 @@ Examples:
             chunk_duration=args.chunk_duration,
             max_words=args.max_words,
             word_gap=args.word_gap,
-            offset=args.offset
+            offset=args.offset,
+            remove_punctuation=args.remove_punctuation
         )
     except Exception as e:
         console.print(f"\n[bold red]Error:[/bold red] {e}")
